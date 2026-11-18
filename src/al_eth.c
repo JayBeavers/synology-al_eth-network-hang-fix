@@ -71,7 +71,10 @@
 #include "al_hal_udma_config.h"
 #include "al_eth_sysfs.h"
 
-#define DRV_MODULE_NAME	 "al_eth"
+#define DRV_MODULE_NAME	 "al_eth_fix"
+
+/* The running kernel exports the out-of-line irq_set_affinity; its header has only the inline. */
+extern int al_eth_fix_irq_set_affinity(unsigned int irq, const struct cpumask *m) __asm__("irq_set_affinity");
 #define DRV_MODULE_VERSION      "0.2"
 #define DRV_MODULE_RELDATE      "Feb 18, 2013"
 
@@ -209,7 +212,7 @@ int al_mdio_read(struct mii_bus *bp, int mii_id, int reg)
 
     return __al_mdio_read(bp, mii_id, reg);
 }
-EXPORT_SYMBOL(al_mdio_read);
+
 #else /* MY_ABC_HERE */
 static int
 al_mdio_read(struct mii_bus *bp, int mii_id, int reg)
@@ -309,7 +312,7 @@ int al_mdio_write(struct mii_bus *bp, int mii_id, int reg, u16 val)
 
 	return __al_mdio_write(bp, mii_id, reg, val);
 }
-EXPORT_SYMBOL(al_mdio_write);
+
 #else /* MY_ABC_HERE */
 static int
 al_mdio_write(struct mii_bus *bp, int mii_id, int reg, u16 val)
@@ -2748,7 +2751,7 @@ al_eth_request_irq(struct al_eth_adapter *adapter)
 			cpu = (int)(device_name[9] - '0');
 			cpumask_clear(&irq->affinity_hint_mask);
 			cpumask_set_cpu(cpu, &irq->affinity_hint_mask);
-			irq_set_affinity(irq->vector, &irq->affinity_hint_mask);
+			al_eth_fix_irq_set_affinity(irq->vector, &irq->affinity_hint_mask);
 		}
 #endif /* MY_ABC_HERE */
 		irq_set_affinity_hint(irq->vector, &irq->affinity_hint_mask);
@@ -4676,7 +4679,7 @@ struct mii_bus *al_get_mdiobus_by_name(const char *ethname)
 	}
 	return BUS_P;
 }
-EXPORT_SYMBOL(al_get_mdiobus_by_name);
+
 #endif /* MY_ABC_HERE */
 
 /**

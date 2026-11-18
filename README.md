@@ -11,7 +11,7 @@ If your Synology stops answering on the network after hours of heavy transfers (
 
 This repo has Synology's own GPL source for the Ethernet driver these models use (`al_eth`, from Annapurna Labs), with fixes, built as a module you can load next to DSM's driver without flashing anything.  A reboot always puts the stock driver back.
 
-Not affiliated with Synology.  Not a confirmed root cause yet, see Status.
+Not affiliated with Synology.  Not a confirmed root cause yet, see Status.  Reported to Synology on their [community forum](https://community.synology.com/enu/forum/1/post/271064) and to [awto-unvr #379](https://github.com/awtoau/awto-unvr/issues/379).
 
 ## Affected models
 

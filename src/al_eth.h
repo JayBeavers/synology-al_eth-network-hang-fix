@@ -336,6 +336,20 @@ struct al_eth_adapter {
 	struct al_eth_retimer_params	retimer;
 
 	bool				phy_fixup_needed;
+
+	/* al_eth_fix additions: keep below every stock field (see al_eth_fix_take) */
+	struct al_eth_fix_q {
+		unsigned int	irqs;		/* MSI-X interrupts taken */
+		unsigned int	irqs_at_tick;	/* irqs at the previous watchdog tick */
+		unsigned int	polls;
+		unsigned int	stalls;		/* masked, idle and silent for two ticks */
+		bool		masked_seen;	/* that state held at the previous tick */
+	} fixq[2 * AL_ETH_NUM_QUEUES];
+	struct delayed_work	kick_task;
+	struct work_struct	reset_task;
+	unsigned long		dma_errors;
+	unsigned long		resets;
+	unsigned long		last_reset;	/* jiffies */
 };
 
 #endif /* !(AL_ETH_H) */

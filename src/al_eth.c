@@ -100,6 +100,23 @@ MODULE_PARM_DESC(disable_msi, "Disable Message Signaled Interrupt (MSI)");
 #define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
 static int debug = -1;
 module_param(debug, int, 0);
+
+static int kick_ms = 1000;
+module_param(kick_ms, int, 0444);
+MODULE_PARM_DESC(kick_ms, "Watchdog interval for stuck queues and UDMA errors, 0 = off");
+
+static int reset_on_error = 0;
+module_param(reset_on_error, int, 0444);
+MODULE_PARM_DESC(reset_on_error, "Reset the port after a UDMA error or TX timeout (at most every 10 s)");
+
+static char *take;
+module_param(take, charp, 0444);
+MODULE_PARM_DESC(take, "PCI address of an up port to take from the built-in al_eth, e.g. 0000:00:01.0");
+
+static inline struct al_eth_fix_q *al_eth_fixq(struct al_eth_napi *al_napi)
+{
+	return &al_napi->adapter->fixq[al_napi - al_napi->adapter->al_napi];
+}
 MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
 
 /* indexed by board_t */
@@ -386,6 +403,8 @@ static int al_eth_flow_ctrl_config(struct al_eth_adapter *adapter);
 static uint8_t al_eth_flow_ctrl_mutual_cap_get(struct al_eth_adapter *adapter);
 static void al_eth_down(struct al_eth_adapter *adapter);
 static int al_eth_up(struct al_eth_adapter *adapter);
+static void al_eth_set_rx_mode(struct net_device *netdev);
+static void al_eth_fix_sysfs(struct device *dev, bool add);
 static void al_eth_serdes_mode_set(struct al_eth_adapter *adapter);
 
 #ifdef MY_ABC_HERE
@@ -742,15 +761,17 @@ static void al_eth_mdiobus_teardown(struct al_eth_adapter *adapter)
 	mdiobus_unregister(adapter->mdio_bus);
 	kfree(adapter->mdio_bus->irq);
 	mdiobus_free(adapter->mdio_bus);
-	phy_device_free(adapter->phydev);
+	adapter->mdio_bus = NULL;
+	adapter->phydev = NULL;
 }
 
 static void al_eth_tx_timeout(struct net_device *dev)
 {
 	struct al_eth_adapter *adapter = netdev_priv(dev);
 
-	if (netif_msg_tx_err(adapter))
-		netdev_err(dev, "transmit timed out!!!!\n");
+	netdev_err(dev, "transmit timed out\n");
+	if (reset_on_error)
+		schedule_work(&adapter->reset_task);
 }
 
 static int al_eth_change_mtu(struct net_device *dev, int new_mtu)
@@ -1732,8 +1753,9 @@ al_eth_refill_rx_bufs(struct al_eth_adapter *adapter, unsigned int qid,
 #elif defined(CONFIG_AL_ETH_ALLOC_SKB)
 		if (unlikely(al_eth_alloc_rx_skb(adapter, rx_ring, rx_info) < 0)) {
 #endif
-			netdev_warn(adapter->netdev, "failed to alloc buffer for rx queue %d\n",
-				    qid);
+			if (net_ratelimit())
+				netdev_warn(adapter->netdev, "failed to alloc buffer for rx queue %d\n",
+					    qid);
 			break;
 		}
 		rc = al_eth_rx_buffer_add(rx_ring->dma_q,
@@ -1748,7 +1770,7 @@ al_eth_refill_rx_bufs(struct al_eth_adapter *adapter, unsigned int qid,
 		next_to_use = AL_ETH_RX_RING_IDX_NEXT(rx_ring, next_to_use);
 	}
 
-	if (unlikely(i < num)) {
+	if (unlikely(i < num) && net_ratelimit()) {
 		netdev_warn(adapter->netdev, "refilled rx queue %d with %d pages only - available %d\n",
 			    qid, i, al_udma_available_get(rx_ring->dma_q));
 	}
@@ -1952,9 +1974,11 @@ al_eth_tx_poll(struct napi_struct *napi, int budget)
 	unsigned int total_done;
 	u16 next_to_clean;
 	int tx_pkt = 0;
+	struct al_eth_fix_q *fq = al_eth_fixq(al_napi);
 #ifdef CONFIG_AL_ETH_ALLOC_SKB
 	struct sk_buff_head *rx_rc = &__get_cpu_var(rx_recycle_cache);
 #endif
+	fq->polls++;
 	total_done = al_eth_comp_tx_get(tx_ring->dma_q);
 	dev_dbg(&adapter->pdev->dev, "tx_poll: q %d total completed descs %x\n",
 		qid, total_done);
@@ -2029,6 +2053,8 @@ al_eth_tx_poll(struct napi_struct *napi, int budget)
 
 	/* all work done, exit the polling mode */
 	napi_complete(napi);
+	/* NAPI_STATE_SCHED must be clear on every CPU before the vector can fire again */
+	wmb();
 	al_reg_write32_relaxed(tx_ring->unmask_reg_offset, tx_ring->unmask_val);
 	return 0;
 }
@@ -2302,6 +2328,12 @@ al_eth_rx_poll(struct napi_struct *napi, int budget)
 	u16 next_to_clean = rx_ring->next_to_clean;
 	int refill_required;
 	int refill_actual;
+	const int weight = budget;
+	struct al_eth_fix_q *fq = al_eth_fixq(al_napi);
+
+	fq->polls++;
+	if (unlikely(budget <= 0))
+		return 0;
 
 	netdev_dbg(adapter->netdev, "%s qid %d\n", __func__, qid);
 
@@ -2367,13 +2399,17 @@ next:
 	refill_actual = al_eth_refill_rx_bufs(adapter, qid, refill_required);
 
 	if (unlikely(refill_actual < refill_required)) {
-		netdev_warn(adapter->netdev,
-			"%s: rescheduling rx queue %d\n", __func__, qid);
-		napi_reschedule(napi);
+		if (net_ratelimit())
+			netdev_warn(adapter->netdev, "%s: rx queue %d refilled %d of %d, polling again\n",
+				    __func__, qid, refill_actual, refill_required);
+		/* a poll that uses its whole weight stays scheduled */
+		return weight;
 	} else if (budget > 0) {
 		dev_dbg(&adapter->pdev->dev, "rx_poll: q %d done next to clean %x\n",
 			qid, next_to_clean);
 		napi_complete(napi);
+		/* NAPI_STATE_SCHED must be clear on every CPU before the vector can fire again */
+		wmb();
 		al_reg_write32_relaxed(rx_ring->unmask_reg_offset, rx_ring->unmask_val);
 	}
 
@@ -2466,9 +2502,46 @@ static irqreturn_t al_eth_intr_msix_all(int irq, void *data)
  * @irq: interrupt number
  * @data: pointer to a network interface device structure
  **/
+/* Read and clear the secondary (M2S, S2M) error causes until both stay clear,
+ * then the group D summary, so no cause is left holding the summary edge high. */
+static bool al_eth_udma_errors(struct al_eth_adapter *adapter, const char *how)
+{
+	struct unit_regs __iomem *regs = (struct unit_regs __iomem *)adapter->udma_base;
+	struct al_iofic_grp_ctrl __iomem *sec = &regs->gen.interrupt_regs.secondary_iofic_ctrl[0];
+	uint32_t m2s = 0, s2m = 0, a, b, cause_d;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		a = al_iofic_read_cause(sec, AL_INT_GROUP_A);
+		b = al_iofic_read_cause(sec, AL_INT_GROUP_B);
+		if (!a && !b)
+			break;
+		al_iofic_clear_cause(sec, AL_INT_GROUP_A, a);
+		al_iofic_clear_cause(sec, AL_INT_GROUP_B, b);
+		m2s |= a;
+		s2m |= b;
+	}
+	cause_d = al_udma_iofic_read_cause(regs, AL_UDMA_IOFIC_LEVEL_PRIMARY, AL_INT_GROUP_D);
+	if (!m2s && !s2m)
+		return false;
+
+	adapter->dma_errors++;
+	if (net_ratelimit())
+		netdev_err(adapter->netdev, "UDMA error %lu (%s): M2S (tx) 0x%08x, S2M (rx) 0x%08x, group D 0x%08x\n",
+			   adapter->dma_errors, how, m2s, s2m, cause_d);
+	if (reset_on_error)
+		schedule_work(&adapter->reset_task);
+	return true;
+}
+
 static irqreturn_t al_eth_intr_msix_mgmt(int irq, void *data)
 {
-	pr_info("got mgmt interrupt\n");
+	struct al_eth_adapter *adapter = data;
+	struct unit_regs __iomem *regs = (struct unit_regs __iomem *)adapter->udma_base;
+
+	al_eth_udma_errors(adapter, "interrupt");
+	al_udma_iofic_unmask(regs, AL_UDMA_IOFIC_LEVEL_PRIMARY, AL_INT_GROUP_A,
+			     AL_INT_GROUP_A_GROUP_D_SUM);
 	return IRQ_HANDLED;
 }
 
@@ -2482,6 +2555,7 @@ static irqreturn_t al_eth_intr_msix_tx(int irq, void *data)
 	struct al_eth_napi *al_napi = data;
 
 	pr_debug("%s\n", __func__);
+	al_eth_fixq(al_napi)->irqs++;
 	napi_schedule(&al_napi->napi);
 
 	return IRQ_HANDLED;
@@ -2498,6 +2572,7 @@ static irqreturn_t al_eth_intr_msix_rx(int irq, void *data)
 	struct al_eth_napi *al_napi = data;
 
 	pr_debug("%s\n", __func__);
+	al_eth_fixq(al_napi)->irqs++;
 	napi_schedule(&al_napi->napi);
 	return IRQ_HANDLED;
 }
@@ -3231,6 +3306,8 @@ static int al_eth_up(struct al_eth_adapter *adapter)
 	al_eth_up_complete(adapter);
 
 	adapter->up = true;
+	if (kick_ms > 0 && adapter->int_mode == AL_IOFIC_MODE_MSIX_PER_Q)
+		schedule_delayed_work(&adapter->kick_task, msecs_to_jiffies(kick_ms));
 
 	return rc;
 
@@ -3480,11 +3557,100 @@ static void al_eth_serdes_init(struct al_eth_adapter *adapter)
 #endif
 }
 
+/* A queue is stuck when its vector is masked (it fired) but NAPI is not
+ * scheduled and no interrupt arrived, for two ticks running: nothing will
+ * ever unmask it. Poll it, which unmasks it, and say so. */
+static void al_eth_kick_task(struct work_struct *work)
+{
+	struct al_eth_adapter *adapter = container_of(to_delayed_work(work),
+				       struct al_eth_adapter, kick_task);
+	struct unit_regs __iomem *regs = (struct unit_regs __iomem *)adapter->udma_base;
+	int i;
+
+	if (!adapter->up)
+		return;
+
+	al_eth_udma_errors(adapter, "watchdog");
+
+	local_bh_disable();
+	for (i = 0; i < adapter->num_rx_queues + adapter->num_tx_queues; i++) {
+		struct al_eth_napi *al_napi = &adapter->al_napi[i];
+		struct al_eth_fix_q *fq = &adapter->fixq[i];
+		bool rx = i < adapter->num_rx_queues;
+		int group = rx ? AL_INT_GROUP_B : AL_INT_GROUP_C;
+		uint32_t bit = 1 << (rx ? i : i - adapter->num_rx_queues);
+		unsigned int irqs = ACCESS_ONCE(fq->irqs);
+		bool stuck;
+
+		stuck = (readl(&regs->gen.interrupt_regs.main_iofic.ctrl[group].int_mask_grp) & bit) &&
+			!test_bit(NAPI_STATE_SCHED, &al_napi->napi.state) &&
+			irqs == fq->irqs_at_tick;
+		fq->irqs_at_tick = irqs;
+		if (!stuck) {
+			fq->masked_seen = false;
+			continue;
+		}
+		if (!fq->masked_seen) {
+			fq->masked_seen = true;
+			continue;
+		}
+		fq->masked_seen = false;
+		fq->stalls++;
+		netdev_warn(adapter->netdev, "%s queue %d: interrupt masked with no poll pending; polling to recover (stall %u)\n",
+			    rx ? "rx" : "tx", rx ? i : i - adapter->num_rx_queues, fq->stalls);
+		if (napi_schedule_prep(&al_napi->napi))
+			__napi_schedule(&al_napi->napi);
+	}
+	local_bh_enable();
+
+	schedule_delayed_work(&adapter->kick_task, msecs_to_jiffies(kick_ms));
+}
+
+static void al_eth_reset_task(struct work_struct *work)
+{
+	struct al_eth_adapter *adapter = container_of(work, struct al_eth_adapter, reset_task);
+	struct net_device *netdev = adapter->netdev;
+
+	rtnl_lock();
+	if (!netif_running(netdev) || !adapter->up)
+		goto out;
+	if (adapter->resets && time_before(jiffies, adapter->last_reset + 10 * HZ)) {
+		netdev_warn(netdev, "reset skipped, last one under 10 s ago\n");
+		goto out;
+	}
+	adapter->resets++;
+	adapter->last_reset = jiffies;
+	netdev_err(netdev, "resetting the port (reset %lu)\n", adapter->resets);
+	/* keep phylib from running adjust_link against a half-reset MAC */
+	if (adapter->phydev)
+		mutex_lock(&adapter->phydev->lock);
+	al_eth_down(adapter);
+	if (al_eth_up(adapter)) {
+		netdev_err(netdev, "reset: bring-up failed\n");
+	} else if (adapter->phydev) {
+		/* the reset cleared the MAC's speed setting; make adjust_link apply it again */
+		adapter->link_config.old_link = 0;
+		adapter->link_config.active_speed = 0;
+		adapter->link_config.active_duplex = -1;
+		al_eth_adjust_link(netdev);
+	}
+	if (adapter->phydev)
+		mutex_unlock(&adapter->phydev->lock);
+	if (adapter->up) {
+		netif_addr_lock_bh(netdev);
+		al_eth_set_rx_mode(netdev);
+		netif_addr_unlock_bh(netdev);
+	}
+out:
+	rtnl_unlock();
+}
+
 static void al_eth_down(struct al_eth_adapter *adapter)
 {
 	netdev_info(adapter->netdev, "%s\n", __func__);
 
 	adapter->up = false;
+	cancel_delayed_work_sync(&adapter->kick_task);
 
 	netif_carrier_off(adapter->netdev);
 	al_eth_disable_int_sync(adapter);
@@ -4766,6 +4932,8 @@ al_eth_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	adapter->netdev = netdev;
 	adapter->pdev = pdev;
+	INIT_DELAYED_WORK(&adapter->kick_task, al_eth_kick_task);
+	INIT_WORK(&adapter->reset_task, al_eth_reset_task);
 	adapter->board_type = ent->driver_data;
 	hal_adapter = &adapter->hal_adapter;
 	adapter->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
@@ -4879,6 +5047,8 @@ al_eth_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	rc = al_eth_sysfs_init(&adapter->pdev->dev);
+	if (!rc)
+		al_eth_fix_sysfs(&adapter->pdev->dev, true);
 	if (rc)
 		return rc;
 
@@ -4911,16 +5081,10 @@ al_eth_remove(struct pci_dev *pdev)
 	if (adapter->board_type == ALPINE_FPGA_NIC)
 		writel(0, adapter->internal_pcie_base + 0x1800000 + 0x1210);
 
-	al_eth_hw_stop(adapter);
-#ifdef MY_ABC_HERE
-	if (adapter->mdio_bus)
-	{
-		if (adapter->mdio_bus->irq)
-			kfree(adapter->mdio_bus->irq);
-		mdiobus_free(adapter->mdio_bus);
-	}
-#endif /* MY_ABC_HERE */
+	al_eth_fix_sysfs(&pdev->dev, false);
 	unregister_netdev(dev);
+	cancel_work_sync(&adapter->reset_task);
+	al_eth_hw_stop(adapter);
 
 	al_eth_sysfs_terminate(&pdev->dev);
 
@@ -5047,6 +5211,126 @@ static struct pci_driver al_eth_pci_driver = {
 #endif
 };
 
+static ssize_t fix_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct al_eth_adapter *adapter = dev_get_drvdata(dev);
+	int n = 0, i;
+
+	struct unit_regs __iomem *regs = (struct unit_regs __iomem *)adapter->udma_base;
+
+	n += scnprintf(buf + n, PAGE_SIZE - n, "dma_errors %lu resets %lu mask_b 0x%08x mask_c 0x%08x\n",
+		       adapter->dma_errors, adapter->resets,
+		       readl(&regs->gen.interrupt_regs.main_iofic.ctrl[AL_INT_GROUP_B].int_mask_grp),
+		       readl(&regs->gen.interrupt_regs.main_iofic.ctrl[AL_INT_GROUP_C].int_mask_grp));
+	for (i = 0; i < adapter->num_rx_queues + adapter->num_tx_queues; i++) {
+		struct al_eth_fix_q *fq = &adapter->fixq[i];
+		bool rx = i < adapter->num_rx_queues;
+
+		n += scnprintf(buf + n, PAGE_SIZE - n, "%s%d irqs %u polls %u stalls %u\n",
+			       rx ? "rx" : "tx", rx ? i : i - adapter->num_rx_queues,
+			       fq->irqs, fq->polls, fq->stalls);
+	}
+	return n;
+}
+
+static ssize_t fix_reset_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct al_eth_adapter *adapter = dev_get_drvdata(dev);
+
+	schedule_work(&adapter->reset_task);
+	return count;
+}
+
+/* Mask one RX queue's vector while idle: the state a lost wakeup leaves behind. */
+static ssize_t fix_test_stall_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct al_eth_adapter *adapter = dev_get_drvdata(dev);
+	unsigned long q;
+
+	if (kstrtoul(buf, 0, &q) || q >= adapter->num_rx_queues || !adapter->up)
+		return -EINVAL;
+	al_udma_iofic_mask((struct unit_regs __iomem *)adapter->udma_base,
+			   AL_UDMA_IOFIC_LEVEL_PRIMARY, AL_INT_GROUP_B, 1 << q);
+	netdev_warn(adapter->netdev, "test: masked rx queue %lu\n", q);
+	return count;
+}
+
+static DEVICE_ATTR(fix_stats, S_IRUGO, fix_stats_show, NULL);
+static DEVICE_ATTR(fix_reset, S_IWUSR, NULL, fix_reset_store);
+static DEVICE_ATTR(fix_test_stall, S_IWUSR, NULL, fix_test_stall_store);
+
+static void al_eth_fix_sysfs(struct device *dev, bool add)
+{
+	if (add) {
+		if (device_create_file(dev, &dev_attr_fix_stats) ||
+		    device_create_file(dev, &dev_attr_fix_reset) ||
+		    device_create_file(dev, &dev_attr_fix_test_stall))
+			dev_warn(dev, "al_eth_fix sysfs files not created\n");
+		return;
+	}
+	device_remove_file(dev, &dev_attr_fix_stats);
+	device_remove_file(dev, &dev_attr_fix_reset);
+	device_remove_file(dev, &dev_attr_fix_test_stall);
+}
+
+/*
+ * Take one port from the built-in al_eth. Its remove frees the MDIO bus a
+ * second time (BUG on a registered bus, double free after close), so close
+ * the port, clear the dangling pointer, then release it. The adapter is read
+ * with this module's struct, whose stock fields are unchanged; the checks
+ * refuse to touch it if the running kernel's layout differs.
+ */
+static int al_eth_fix_take(const char *name)
+{
+	struct device *dev;
+	struct al_eth_adapter *adapter;
+	struct net_device *netdev;
+	int rc = -EINVAL;
+
+	dev = bus_find_device_by_name(&pci_bus_type, NULL, name);
+	if (!dev) {
+		pr_err("al_eth_fix: %s: no such PCI device\n", name);
+		return -ENODEV;
+	}
+	device_lock(dev);
+	if (!dev->driver || strcmp(dev->driver->name, "al_eth")) {
+		pr_err("al_eth_fix: %s: not bound to the built-in al_eth\n", name);
+		goto out;
+	}
+	adapter = dev_get_drvdata(dev);
+	netdev = adapter ? adapter->netdev : NULL;
+	if (!netdev || adapter->pdev != to_pci_dev(dev) || netdev_priv(netdev) != adapter) {
+		pr_err("al_eth_fix: %s: adapter layout does not match, not touching it\n", name);
+		goto out;
+	}
+	rtnl_lock();
+	if (!netif_running(netdev) || !adapter->mdio_bus || adapter->mdio_bus->priv != adapter ||
+	    !adapter->phydev || adapter->phydev->attached_dev != netdev ||
+	    adapter->phydev->bus != adapter->mdio_bus ||
+	    adapter->al_napi[0].napi.dev != netdev || adapter->al_napi[0].napi.weight != 64) {
+		rtnl_unlock();
+		pr_err("al_eth_fix: %s: port must be up with its MDIO bus, and the layout must match\n", name);
+		goto out;
+	}
+	dev_close(netdev);
+	/* __dev_open refuses a detached device, so nothing reopens it before remove */
+	netif_device_detach(netdev);
+	adapter->mdio_bus = NULL;
+	adapter->phydev = NULL;
+	rtnl_unlock();
+	device_unlock(dev);
+	device_release_driver(dev);
+	pr_info("al_eth_fix: %s released by al_eth\n", name);
+	put_device(dev);
+	return 0;
+out:
+	device_unlock(dev);
+	put_device(dev);
+	return rc;
+}
+
 static int __init al_eth_init(void)
 {
 #ifdef CONFIG_AL_ETH_ALLOC_SKB
@@ -5058,6 +5342,14 @@ static int __init al_eth_init(void)
 		skb_queue_head_init(rx_rc);
 	}
 #endif
+	pr_info("al_eth_fix: sizeof(struct sk_buff) %zu, sizeof(struct net_device) %zu\n",
+		sizeof(struct sk_buff), sizeof(struct net_device));
+	if (take) {
+		int rc = al_eth_fix_take(take);
+
+		if (rc)
+			return rc;
+	}
 	return pci_register_driver(&al_eth_pci_driver);
 }
 
